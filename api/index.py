@@ -4,7 +4,7 @@ import uuid
 import secrets
 import hashlib
 from datetime import datetime
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Header
@@ -12,14 +12,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
-from langchain_openai import ChatOpenAI
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnableParallel, RunnablePassthrough
-from langchain_core.output_parsers import StrOutputParser
-from langchain_community.embeddings import DashScopeEmbeddings
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from dashscope import Embedding
+from dashscope.common import ApiResponse
 from pymongo import MongoClient
-from bson import ObjectId
+from qdrant_client import QdrantClient
+from qdrant_client.http import models
 
 
 class Settings(BaseSettings):
@@ -34,6 +31,8 @@ class Settings(BaseSettings):
     CHUNK_OVERLAP: int = 50
     TOP_K: int = 3
     MONGODB_URI: str = ""
+    QDRANT_URL: str = ""
+    QDRANT_API_KEY: str = ""
 
     class Config:
         env_file = ".env"
@@ -56,6 +55,7 @@ mongo_client = None
 db = None
 users_collection = None
 conversations_collection = None
+qdrant_client = None
 
 if settings.MONGODB_URI:
     try:
@@ -67,6 +67,17 @@ if settings.MONGODB_URI:
         print("MongoDB connected successfully")
     except Exception as e:
         print(f"MongoDB connection failed: {e}")
+
+if settings.QDRANT_URL and settings.QDRANT_API_KEY:
+    try:
+        qdrant_client = QdrantClient(
+            url=settings.QDRANT_URL,
+            api_key=settings.QDRANT_API_KEY
+        )
+        collections = qdrant_client.get_collections()
+        print(f"Qdrant connected successfully. Collections: {collections}")
+    except Exception as e:
+        print(f"Qdrant connection failed: {e}")
 
 
 class Message(BaseModel):
@@ -131,14 +142,9 @@ class QueryAnalytics(BaseModel):
 
 
 tokens: Dict[str, str] = {}
-vector_store = None
-llm = None
-embeddings = None
-splitter = RecursiveCharacterTextSplitter(
-    chunk_size=settings.CHUNK_SIZE,
-    chunk_overlap=settings.CHUNK_OVERLAP,
-    length_function=len
-)
+documents_store: Dict[int, dict] = {}
+CHUNK_SIZE = settings.CHUNK_SIZE
+CHUNK_OVERLAP = settings.CHUNK_OVERLAP
 
 
 def hash_password(password: str) -> str:
@@ -161,48 +167,127 @@ def verify_token(authorization: Optional[str] = Header(None)) -> Optional[str]:
     return tokens.get(token)
 
 
-def init_llm():
-    global llm
+def get_embedding(text: str) -> Optional[List[float]]:
     if not settings.DASHSCOPE_API_KEY:
+        return None
+    try:
+        response = Embedding.call(
+            model=settings.EMBEDDING_MODEL,
+            api_key=settings.DASHSCOPE_API_KEY,
+            input=text
+        )
+        if response.status_code == 200:
+            return response.output['embeddings'][0]['embedding']
+        return None
+    except Exception as e:
+        print(f"Embedding error: {e}")
+        return None
+
+
+def split_text(text: str) -> List[str]:
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + CHUNK_SIZE
+        chunk = text[start:end]
+        chunks.append(chunk)
+        start = end - CHUNK_OVERLAP
+    return chunks
+
+
+def search_documents(query: str, top_k: int = 3) -> List[dict]:
+    if not qdrant_client:
+        return []
+    
+    query_embedding = get_embedding(query)
+    if not query_embedding:
+        return []
+    
+    try:
+        search_result = qdrant_client.search(
+            collection_name="knowledge_base",
+            query_vector=query_embedding,
+            limit=top_k
+        )
+        
+        results = []
+        for point in search_result:
+            results.append({
+                "content": point.payload.get("content", ""),
+                "source": point.payload.get("source", "未知"),
+                "chunk_id": point.payload.get("chunk_id", 0),
+                "score": point.score
+            })
+        return results
+    except Exception as e:
+        print(f"Search error: {e}")
+        return []
+
+
+def add_documents_to_qdrant(chunks: List[str], source: str):
+    if not qdrant_client:
         return
-    os.environ["DASHSCOPE_API_KEY"] = settings.DASHSCOPE_API_KEY
-    llm = ChatOpenAI(
-        base_url='https://dashscope.aliyuncs.com/compatible-mode/v1',
-        api_key=settings.DASHSCOPE_API_KEY,
-        model=settings.LLM_MODEL,
-        temperature=settings.TEMPERATURE,
-        max_tokens=settings.MAX_TOKENS,
-        streaming=True
-    )
+    
+    try:
+        qdrant_client.recreate_collection(
+            collection_name="knowledge_base",
+            vectors_config=models.VectorParams(
+                size=1536,
+                distance=models.Distance.COSINE
+            )
+        )
+    except:
+        pass
+    
+    points = []
+    for i, chunk in enumerate(chunks):
+        embedding = get_embedding(chunk)
+        if embedding:
+            point_id = len(documents_store)
+            documents_store[point_id] = {
+                "content": chunk,
+                "source": source,
+                "chunk_id": i
+            }
+            points.append(models.PointStruct(
+                id=point_id,
+                vector=embedding,
+                payload={
+                    "content": chunk,
+                    "source": source,
+                    "chunk_id": i
+                }
+            ))
+    
+    if points:
+        qdrant_client.upsert(
+            collection_name="knowledge_base",
+            points=points
+        )
 
 
 def get_answer(question: str) -> Dict:
-    if not vector_store:
+    if not qdrant_client:
         return {"answer": "知识库尚未准备就绪，请先上传文档。", "sources": []}
     
-    if not llm:
-        init_llm()
+    docs = search_documents(question, settings.TOP_K)
     
-    if not llm:
-        return {"answer": "LLM 未配置，请检查 API Key。", "sources": []}
+    if not docs:
+        return {"answer": "在知识库中未找到相关信息。", "sources": []}
+    
+    context = "\n\n".join([doc["content"] for doc in docs])
     
     try:
-        docs = vector_store.similarity_search(question, k=settings.TOP_K)
-        sources = [
-            {
-                "content": doc.page_content[:200] + "..." if len(doc.page_content) > 200 else doc.page_content,
-                "source": doc.metadata.get("source", "未知"),
-                "chunk_id": doc.metadata.get("chunk_id", 0)
-            }
-            for doc in docs
-        ]
+        import urllib.request
+        import urllib.error
         
-        context = "\n\n".join([doc.page_content for doc in docs])
+        url = 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions'
+        headers = {
+            'Content-Type': 'application/json',
+            'Authorization': f'Bearer {settings.DASHSCOPE_API_KEY}'
+        }
         
-        if not context.strip():
-            return {"answer": "在知识库中未找到相关信息。", "sources": []}
-        
-        template = """你是一个专业的知识库问答助手，专门帮助用户解答关于文档的问题。
+        prompt = f"""你是一个专业的知识库问答助手，专门帮助用户解答关于文档的问题。
 请用专业、友好的语气回答问题。如果知识库中有相关信息，请基于内容回答；如果没有，请说明无法找到相关信息。
 
 背景知识：
@@ -212,42 +297,56 @@ def get_answer(question: str) -> Dict:
 
 请提供清晰、准确的回答。回答："""
         
-        prompt = ChatPromptTemplate.from_template(template)
-        chain = (
-            RunnableParallel({"context": lambda x: context, "question": RunnablePassthrough()})
-            | prompt
-            | llm
-            | StrOutputParser()
-        )
+        data = json.dumps({
+            "model": settings.LLM_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": settings.TEMPERATURE,
+            "max_tokens": settings.MAX_TOKENS
+        }).encode('utf-8')
         
-        answer = chain.invoke(question)
-        return {"answer": answer, "sources": sources}
-    
+        req = urllib.request.Request(url, data=data, headers=headers, method='POST')
+        with urllib.request.urlopen(req, timeout=30) as response:
+            result = json.loads(response.read().decode('utf-8'))
+            answer = result['choices'][0]['message']['content']
+            
+            return {
+                "answer": answer,
+                "sources": [
+                    {
+                        "content": doc["content"][:200] + "..." if len(doc["content"]) > 200 else doc["content"],
+                        "source": doc["source"],
+                        "chunk_id": doc["chunk_id"]
+                    }
+                    for doc in docs
+                ]
+            }
     except Exception as e:
         return {"answer": f"处理问题时出现错误：{str(e)}", "sources": []}
 
 
 def streaming_answer(question: str):
-    if not vector_store:
+    if not qdrant_client:
         yield "知识库尚未准备就绪，请先上传文档。"
         return
     
-    if not llm:
-        init_llm()
+    docs = search_documents(question, settings.TOP_K)
     
-    if not llm:
-        yield "LLM 未配置，请检查 API Key。"
+    if not docs:
+        yield "在知识库中未找到相关信息。"
         return
     
+    context = "\n\n".join([doc["content"] for doc in docs])
+    
     try:
-        docs = vector_store.similarity_search(question, k=settings.TOP_K)
-        context = "\n\n".join([doc.page_content for doc in docs])
+        import urllib.request
         
-        if not context.strip():
-            yield "在知识库中未找到相关信息。"
-            return
+        url = 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions'
+        headers = {
+            'Content-Type': 'application/json',
+            'Authorization': f'Bearer {settings.DASHSCOPE_API_KEY}'
+        }
         
-        template = """你是一个专业的知识库问答助手，专门帮助用户解答关于文档的问题。
+        prompt = f"""你是一个专业的知识库问答助手，专门帮助用户解答关于文档的问题。
 请用专业、友好的语气回答问题。如果知识库中有相关信息，请基于内容回答；如果没有，请说明无法找到相关信息。
 
 背景知识：
@@ -257,17 +356,31 @@ def streaming_answer(question: str):
 
 请提供清晰、准确的回答。回答："""
         
-        prompt = ChatPromptTemplate.from_template(template)
-        chain = (
-            RunnableParallel({"context": lambda x: context, "question": RunnablePassthrough()})
-            | prompt
-            | llm
-            | StrOutputParser()
-        )
+        data = json.dumps({
+            "model": settings.LLM_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": settings.TEMPERATURE,
+            "max_tokens": settings.MAX_TOKENS,
+            "stream": True
+        }).encode('utf-8')
         
-        for chunk in chain.stream(question):
-            yield chunk
-    
+        req = urllib.request.Request(url, data=data, headers=headers, method='POST')
+        
+        with urllib.request.urlopen(req, timeout=60) as response:
+            import base64
+            for line in response:
+                line = line.decode('utf-8')
+                if line.startswith('data: '):
+                    if line.strip() == 'data: [DONE]':
+                        break
+                    try:
+                        chunk_data = json.loads(line[6:])
+                        if 'choices' in chunk_data and len(chunk_data['choices']) > 0:
+                            delta = chunk_data['choices'][0].get('delta', {})
+                            if 'content' in delta:
+                                yield delta['content']
+                    except:
+                        pass
     except Exception as e:
         yield f"处理问题时出现错误：{str(e)}"
 
@@ -279,11 +392,10 @@ async def root():
 
 @app.get("/api/health")
 async def health_check():
-    mongo_status = "connected" if mongo_client else "not configured"
     return {
         "status": "healthy",
-        "mongodb": mongo_status,
-        "vector_store_ready": vector_store is not None
+        "mongodb": "connected" if mongo_client else "not configured",
+        "qdrant": "connected" if qdrant_client else "not configured"
     }
 
 
@@ -662,37 +774,9 @@ async def upload_document(
     content = await file.read()
     text = content.decode('utf-8')
     
-    chunks = splitter.split_text(text)
+    chunks = split_text(text)
     
-    global vector_store, embeddings
-    
-    from langchain_core.documents import Document
-    
-    docs = [
-        Document(
-            page_content=chunk,
-            metadata={"source": file.filename, "chunk_id": i}
-        )
-        for i, chunk in enumerate(chunks)
-    ]
-    
-    if embeddings is None and settings.DASHSCOPE_API_KEY:
-        os.environ["DASHSCOPE_API_KEY"] = settings.DASHSCOPE_API_KEY
-        embeddings = DashScopeEmbeddings(
-            model=settings.EMBEDDING_MODEL,
-            dashscope_api_key=settings.DASHSCOPE_API_KEY
-        )
-    
-    if embeddings is None:
-        raise HTTPException(status_code=500, detail="嵌入模型未配置")
-    
-    from langchain_community.vectorstores import FAISS
-    new_vector_store = FAISS.from_documents(documents=docs, embedding=embeddings)
-    
-    if vector_store is not None:
-        vector_store.merge_from(new_vector_store)
-    else:
-        vector_store = new_vector_store
+    add_documents_to_qdrant(chunks, file.filename)
     
     return {
         "id": str(uuid.uuid4()),
