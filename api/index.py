@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
-from dashscope import Embeddings
+from dashscope import embeddings
 from pymongo import MongoClient
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
@@ -170,7 +170,7 @@ def get_embedding(text: str) -> Optional[List[float]]:
     if not settings.DASHSCOPE_API_KEY:
         return None
     try:
-        response = Embeddings.call(
+        response = embeddings.call(
             model=settings.EMBEDDING_MODEL,
             input=text
         )
