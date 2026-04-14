@@ -9,7 +9,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Header
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 from dashscope import embeddings
@@ -385,7 +385,7 @@ def streaming_answer(question: str):
 
 @app.get("/")
 async def root():
-    return {"message": "RAG智能助手 API", "version": settings.APP_VERSION}
+    return {"message": "RAG智能助手 API", "version": "1.0.0"}
 
 
 @app.get("/api/health")
