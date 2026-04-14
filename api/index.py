@@ -58,7 +58,13 @@ qdrant_client = None
 
 if settings.MONGODB_URI:
     try:
-        mongo_client = MongoClient(settings.MONGODB_URI)
+        mongo_client = MongoClient(
+            settings.MONGODB_URI,
+            tls=True,
+            tlsAllowInvalidCertificates=True,
+            serverSelectionTimeoutMS=30000,
+            connectTimeoutMS=30000
+        )
         db = mongo_client["rag_assistant"]
         users_collection = db["users"]
         conversations_collection = db["conversations"]
